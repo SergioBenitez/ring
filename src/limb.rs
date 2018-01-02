@@ -208,18 +208,23 @@ pub fn big_endian_from_limbs(limbs: &[Limb], out: &mut [u8]) {
     }
 }
 
-extern {
-    #[cfg(feature = "use_heap")]
+#[cfg(feature = "use_heap")]
+versioned_extern! {
     fn LIMBS_are_even(a: *const Limb, num_limbs: c::size_t) -> LimbMask;
     fn LIMBS_are_zero(a: *const Limb, num_limbs: c::size_t) -> LimbMask;
-    #[cfg(any(test, feature = "rsa_signing"))]
-    fn LIMBS_equal_limb(a: *const Limb, b: Limb, num_limbs: c::size_t)
-                        -> LimbMask;
-    fn LIMBS_less_than(a: *const Limb, b: *const Limb, num_limbs: c::size_t)
-                       -> LimbMask;
-    #[cfg(feature = "use_heap")]
     fn LIMBS_less_than_limb(a: *const Limb, b: Limb, num_limbs: c::size_t)
                             -> LimbMask;
+}
+
+#[cfg(any(test, feature = "rsa_signing"))]
+versioned_extern! {
+    fn LIMBS_equal_limb(a: *const Limb, b: Limb, num_limbs: c::size_t)
+                        -> LimbMask;
+}
+
+versioned_extern! {
+    fn LIMBS_less_than(a: *const Limb, b: *const Limb, num_limbs: c::size_t)
+                       -> LimbMask;
     fn LIMBS_reduce_once(r: *mut Limb, m: *const Limb, num_limbs: c::size_t);
 }
 
