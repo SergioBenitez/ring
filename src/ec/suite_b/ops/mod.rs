@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn p384_elem_sub_test() {
-        extern {
+        versioned_extern! {
             fn GFp_p384_elem_sub(r: *mut Limb, a: *const Limb, b: *const Limb);
         }
         elem_sub_test(&p384::COMMON_OPS, GFp_p384_elem_sub,
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn p384_elem_div_by_2_test() {
-        extern {
+        versioned_extern! {
             fn GFp_p384_elem_div_by_2(r: *mut Limb, a: *const Limb);
         }
         elem_div_by_2_test(&p384::COMMON_OPS, GFp_p384_elem_div_by_2,
@@ -545,7 +545,7 @@ mod tests {
     // TODO: Add test vectors that test the range of values above `q`.
     #[test]
     fn p256_elem_neg_test() {
-        extern {
+        versioned_extern! {
             fn GFp_nistz256_neg(r: *mut Limb, a: *const Limb);
         }
         elem_neg_test(&p256::COMMON_OPS, GFp_nistz256_neg,
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn p384_elem_neg_test() {
-        extern {
+        versioned_extern! {
             fn GFp_p384_elem_neg(r: *mut Limb, a: *const Limb);
         }
         elem_neg_test(&p384::COMMON_OPS, GFp_p384_elem_neg,
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn p256_scalar_square_test() {
-        extern {
+        versioned_extern! {
             fn GFp_p256_scalar_sqr_rep_mont(r: *mut Limb, a: *const Limb,
                                             rep: c::int);
         }
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn p256_point_sum_mixed_test() {
-        extern {
+        versioned_extern! {
             fn GFp_nistz256_point_add_affine(
                 r: *mut Limb/*[p256::COMMON_OPS.num_limbs*3]*/,
                 a: *const Limb/*[p256::COMMON_OPS.num_limbs*3]*/,
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn p256_point_double_test() {
-        extern {
+        versioned_extern! {
             fn GFp_nistz256_point_double(
                 r: *mut Limb/*[p256::COMMON_OPS.num_limbs*3]*/,
                 a: *const Limb/*[p256::COMMON_OPS.num_limbs*3]*/);
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn p384_point_double_test() {
-        extern {
+        versioned_extern! {
             fn GFp_nistz384_point_double(
                 r: *mut Limb/*[p384::COMMON_OPS.num_limbs*3]*/,
                 a: *const Limb/*[p384::COMMON_OPS.num_limbs*3]*/);

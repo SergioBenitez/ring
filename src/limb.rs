@@ -209,7 +209,7 @@ pub fn big_endian_from_limbs_padded(limbs: &[Limb], out: &mut [u8]) {
     polyfill::slice::fill(to_zero, 0);
 }
 
-extern {
+versioned_extern! {
     fn LIMBS_are_zero(a: *const Limb, num_limbs: c::size_t) -> LimbMask;
     fn LIMBS_less_than(a: *const Limb, b: *const Limb, num_limbs: c::size_t)
                        -> LimbMask;

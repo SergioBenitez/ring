@@ -38,16 +38,19 @@
 
 extern crate cc;
 extern crate rayon;
+extern crate native_versioning;
 
 // In the `pregenerate_asm_main()` case we don't want to access (Cargo)
 // environment variables at all, so avoid `use std::env` here.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs::{self, DirEntry};
 use std::time::SystemTime;
 use rayon::iter::{ParallelIterator, IndexedParallelIterator,
                   IntoParallelIterator, IntoParallelRefIterator};
+use native_versioning::{HeaderInclude, write_versioned_header};
 
 const X86: &'static str = "x86";
 const X86_64: &'static str = "x86_64";
@@ -159,7 +162,8 @@ const RING_INCLUDES: &'static [&'static str] =
       "include/GFp/bn.h",
       "include/GFp/cpu.h",
       "include/GFp/mem.h",
-      "include/GFp/type_check.h"];
+      "include/GFp/type_check.h",
+      "include/versioned.h"];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const RING_PERL_INCLUDES: &'static [&'static str] =
@@ -271,8 +275,78 @@ const MSVC: &'static str = "msvc";
 const MSVC_OBJ_OPT: &'static str = "/Fo";
 const MSVC_OBJ_EXT: &'static str = "obj";
 
+const GENERATED_VERSIONED_HEADER: &str = "generated_versioned.h";
+const GENERATED_YASM_VERSIONED_HEADER: &str = "yasm_versioned.h";
+const GENERATED_VERSIONED_MACRO: &str = "VERSIONED";
+const GENERATED_INCLUDE_DIR: &str = "generated_headers";
+
+fn generated_include_dir() -> PathBuf {
+    PathBuf::from(::std::env::var("OUT_DIR").unwrap()).join(GENERATED_INCLUDE_DIR)
+}
+
+fn custom_versioned_symbols_header() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include").join("versioned.h")
+}
+
+fn yasm_versioned_symbols_header() -> PathBuf {
+    PathBuf::from(::std::env::var("OUT_DIR").unwrap())
+        .join(GENERATED_INCLUDE_DIR)
+        .join(GENERATED_YASM_VERSIONED_HEADER)
+}
+
+// Take the versioned header in `from`, replace #define with %define, preprocess
+// it with the C compiler, write it out to `yasm_versioned_symbols_header()`.
+fn write_yasm_versioned_header(from: &Path) -> io::Result<()> {
+    use std::fs::File;
+    use std::io::{BufReader, BufRead, Write, Cursor};
+
+    // Create the data for the intermediate file.
+    let mut new_data = String::new();
+    for line in BufReader::new(File::open(from)?).lines() {
+        use std::fmt::Write;
+        let line = line?;
+        if line.starts_with("#define") {
+            write!(new_data, "%{}\n", &line[1..]).expect("write to str");
+        } else {
+            write!(new_data, "{}\n", line).expect("write to str");
+        }
+    }
+
+    // Write the data to the intermediate file.
+    let output = yasm_versioned_symbols_header();
+    let intermediate = output.with_extension("in.h");
+    File::create(&intermediate)?.write_all(new_data.as_bytes())?;
+
+    // Expand the intermedia file.
+    let expanded = cc::Build::new()
+        .file(&intermediate)
+        .include(&generated_include_dir())
+        .expand();
+
+    // Write a header suitable for prepended to yasm files.
+    let mut out_file = File::create(&output)?;
+    for line in Cursor::new(expanded).lines() {
+        let line = line?;
+        if !line.starts_with('#') {
+            write!(out_file, "{}\n", line)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_versioned_headers() {
+    let _ = write_versioned_header(&generated_include_dir(),
+            GENERATED_VERSIONED_HEADER, GENERATED_VERSIONED_MACRO)
+        .expect("generated versioned header file");
+
+    write_yasm_versioned_header(&custom_versioned_symbols_header())
+        .expect("generated yasm header file");
+}
 
 fn main() {
+    write_versioned_headers();
+
     if let Ok(package_name) = std::env::var("CARGO_PKG_NAME") {
         if package_name == "ring" {
             ring_build_rs_main();
@@ -475,6 +549,8 @@ fn build_library(target: &Target, out_dir: &Path, lib_name: &str,
         .map(|f| Path::new(f))
         .any(|p| need_run(&p, &lib_path, includes_modified)) {
         let mut c = cc::Build::new();
+        let _ = c.include(&generated_include_dir())
+            .include_header(&custom_versioned_symbols_header());
 
         for f in LD_FLAGS {
             let _ = c.flag(&f);
@@ -536,7 +612,10 @@ fn cc(file: &Path, ext: &str, target: &Target, warnings_are_errors: bool,
       out_dir: &Path)
       -> Command {
     let mut c = cc::Build::new();
-    let _ = c.include("include");
+    let _ = c.include("include")
+        .include(&generated_include_dir())
+        .include_header(&custom_versioned_symbols_header());
+
     match ext {
         "c" => {
             for f in c_flags(target) {
@@ -610,11 +689,13 @@ fn yasm(file: &Path, arch: &str, out_file: &Path) -> Command {
         "x86" => ("--oformat=win32", "--machine=x86"),
         _ => panic!("unsupported arch: {}", arch),
     };
+
     let mut c = Command::new("yasm.exe");
     let _ = c.arg("-X").arg("vc")
              .arg("--dformat=cv8")
              .arg(oformat)
              .arg(machine)
+             .arg("-P").arg(&yasm_versioned_symbols_header())
              .arg("-o").arg(out_file.to_str().expect("Invalid path"))
              .arg(file);
     c

@@ -115,7 +115,7 @@ mod sysrand_chunk {
     use {c, error};
     use libc;
 
-    extern {
+    versioned_extern! {
         static GFp_SYS_GETRANDOM: c::long;
     }
 

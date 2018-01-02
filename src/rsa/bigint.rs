@@ -1144,7 +1144,7 @@ mod repr_c {
         }
     }
 
-    extern {
+    versioned_extern! {
         fn GFp_bn_correct_top(r: &mut BIGNUM);
         fn GFp_bn_wexpand(r: &mut BIGNUM, words: c::int) -> c::int;
     }
@@ -1152,7 +1152,7 @@ mod repr_c {
 
 pub use self::repr_c::BIGNUM;
 
-extern {
+versioned_extern! {
     // `r` and/or 'a' and/or 'b' may alias.
     fn GFp_BN_mod_mul_mont(r: *mut BIGNUM, a: *const BIGNUM, b: *const BIGNUM,
                             n: &BIGNUM, n0: &N0) -> c::int;
@@ -1169,7 +1169,7 @@ extern {
 }
 
 #[cfg(feature = "rsa_signing")]
-extern {
+versioned_extern! {
     // `r` and `a` may alias.
     fn GFp_BN_mod_exp_mont_consttime(r: *mut BIGNUM, a_mont: *const BIGNUM,
                                      p: &BIGNUM, p_bits: c::size_t,

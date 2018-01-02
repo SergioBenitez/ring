@@ -327,7 +327,7 @@ unsafe extern fn GFp_p384_elem_sqr_mont(
 }
 
 
-extern {
+versioned_extern! {
     fn GFp_p384_elem_add(r: *mut Limb/*[COMMON_OPS.num_limbs]*/,
                          a: *const Limb/*[COMMON_OPS.num_limbs]*/,
                          b: *const Limb/*[COMMON_OPS.num_limbs]*/);
