@@ -163,7 +163,7 @@ const RING_INCLUDES: &'static [&'static str] =
       "include/GFp/cpu.h",
       "include/GFp/mem.h",
       "include/GFp/type_check.h",
-      "include/versioned.h"];
+      "include/GFp/versioned.h"];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const RING_PERL_INCLUDES: &'static [&'static str] =
@@ -276,7 +276,7 @@ const MSVC_OBJ_OPT: &'static str = "/Fo";
 const MSVC_OBJ_EXT: &'static str = "obj";
 
 const GENERATED_VERSIONED_HEADER: &str = "generated_versioned.h";
-const GENERATED_YASM_VERSIONED_HEADER: &str = "yasm_versioned.h";
+const GENERATED_YASM_VERSIONED_HEADER: &str = "generated_yasm_versioned.h";
 const GENERATED_VERSIONED_MACRO: &str = "VERSIONED";
 const GENERATED_INCLUDE_DIR: &str = "generated_headers";
 
@@ -285,13 +285,14 @@ fn generated_include_dir() -> PathBuf {
 }
 
 fn custom_versioned_symbols_header() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include").join("versioned.h")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("include")
+        .join("GFp")
+        .join("versioned.h")
 }
 
 fn yasm_versioned_symbols_header() -> PathBuf {
-    PathBuf::from(::std::env::var("OUT_DIR").unwrap())
-        .join(GENERATED_INCLUDE_DIR)
-        .join(GENERATED_YASM_VERSIONED_HEADER)
+    generated_include_dir().join(GENERATED_YASM_VERSIONED_HEADER)
 }
 
 // Take the versioned header in `from`, replace #define with %define, preprocess
