@@ -86,6 +86,7 @@ extern crate std;
 
 extern crate untrusted;
 
+#[no_link]
 #[macro_use]
 extern crate native_versioning;
 
