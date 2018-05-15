@@ -20,11 +20,8 @@
 
 /// RSA signatures.
 
-use {bits, der, error};
+use {bits, der, limb, error};
 use untrusted;
-
-#[cfg(feature = "rsa_signing")]
-use limb;
 
 mod padding;
 
@@ -44,7 +41,8 @@ pub use self::padding::{
 
 
 // Maximum RSA modulus size supported for signature verification (in bytes).
-const PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN: usize = 8192 / 8;
+const PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN: usize =
+    bigint::MODULUS_MAX_LIMBS * limb::LIMB_BYTES;
 
 // Keep in sync with the documentation comment for `RSAKeyPair`.
 #[cfg(feature = "rsa_signing")]
@@ -88,10 +86,10 @@ fn parse_public_key(input: untrusted::Input)
 }
 
 fn check_public_modulus_and_exponent(
-        n: bigint::Positive, e: bigint::Positive, n_min_bits: bits::BitLength,
-        n_max_bits: bits::BitLength, e_min_bits: bits::BitLength)
-        -> Result<(bigint::OddPositive, bigint::PublicExponent),
-                  error::Unspecified> {
+        n: untrusted::Input, e: untrusted::Input, n_min_bits: bits::BitLength,
+        n_max_bits: bits::BitLength, e_min_value: u64)
+        -> Result<(bigint::Modulus<N>, bits::BitLength,
+                   bigint::PublicExponent), error::Unspecified> {
     // This is an incomplete implementation of NIST SP800-56Br1 Section
     // 6.4.2.2, "Partial Public-Key Validation for RSA." That spec defers to
     // NIST SP800-89 Section 5.3.3, "(Explicit) Partial Public Key Validation
@@ -101,9 +99,8 @@ fn check_public_modulus_and_exponent(
     // lettered. TODO: Document this in the end-user documentation for RSA
     // keys.
 
-    // Step 3 / Step c (out of order).
-    let n = n.into_odd_positive()?;
-    let e = e.into_odd_positive()?;
+    // Step 3 / Step c for `n` (out of order).
+    let (n, n_bits) = bigint::Modulus::from_be_bytes_with_bit_length(n)?;
 
     // `pkcs1_encode` depends on this not being small. Otherwise,
     // `pkcs1_encode` would generate padding that is invalid (too few 0xFF
@@ -114,7 +111,6 @@ fn check_public_modulus_and_exponent(
     // the public modulus to be exactly 2048 or 3072 bits, but we are more
     // flexible to be compatible with other commonly-used crypto libraries.
     assert!(n_min_bits >= N_MIN_BITS);
-    let n_bits = n.bit_length();
     let n_bits_rounded_up =
         bits::BitLength::from_usize_bytes(n_bits.as_usize_bytes_rounded_up())?;
     if n_bits_rounded_up < n_min_bits {
@@ -125,32 +121,29 @@ fn check_public_modulus_and_exponent(
     }
 
     // Step 2 / Step b. NIST SP800-89 defers to FIPS 186-3, which requires
-    // `e > 2**16`, so the requirement is met if and only if `e_min_bits >= 17`.
-    // We enforce this when signing, but are more flexible in verification, for
-    // compatibility.
-    debug_assert!(e_min_bits >= bits::BitLength::from_usize_bits(2));
-    let e_bits = e.bit_length();
-    if e_bits < e_min_bits {
-        return Err(error::Unspecified);
-    }
+    // `e >= 65537`. We enforce this when signing, but are more flexible in
+    // verification, for compatibility. Only small public exponents are
+    // supported.
+    debug_assert!(e_min_value >= 3);
+    debug_assert!(e_min_value & 1 == 1); // `e_min_value` is odd.
+    debug_assert!(e_min_value <= bigint::PUBLIC_EXPONENT_MAX_VALUE);
 
-    // Only small public exponents are supported.
-    let e = e.into_public_exponent()?;
+    // Step 3 / Step c for `e`.
+    let e = bigint::PublicExponent::from_be_bytes(e, e_min_value)?;
 
     // If `n` is less than `e` then somebody has probably accidentally swapped
     // them. The largest acceptable `e` is smaller than the smallest acceptable
     // `n`, so no additional checks need to be done.
-    debug_assert!(e_min_bits < bigint::PUBLIC_EXPONENT_MAX_BITS);
-    debug_assert!(bigint::PUBLIC_EXPONENT_MAX_BITS < N_MIN_BITS);
 
     // XXX: Steps 4 & 5 / Steps d, e, & f are not implemented. This is also the
     // case in most other commonly-used crypto libraries.
 
-    Ok((n, e))
+    Ok((n, n_bits, e))
 }
 
 // Type-level representation of an RSA public modulus *n*. See
 // `super::bigint`'s modulue-level documentation.
+#[derive(Copy, Clone)]
 pub enum N {}
 
 pub mod verification;

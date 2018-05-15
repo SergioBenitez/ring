@@ -38,140 +38,122 @@
 //! [Static checking of units in Servo]:
 //!     https://blog.mozilla.org/research/2014/06/23/static-checking-of-units-in-servo/
 
+#![allow(box_pointers)]
 
 use {bits, bssl, c, error, limb, untrusted};
 use arithmetic::montgomery::*;
-use core;
 use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+use std;
 
 #[cfg(any(test, feature = "rsa_signing"))]
 use constant_time;
 
 #[cfg(feature = "rsa_signing")]
-use {der, rand};
+use rand;
 
-impl AsRef<BIGNUM> for Positive {
-    fn as_ref<'a>(&'a self) -> &'a BIGNUM { self.0.as_ref() }
+pub unsafe trait Prime {}
+
+pub trait IsOne {
+    fn is_one(&self) -> bool;
 }
 
-impl AsRef<BIGNUM> for Nonnegative {
-    fn as_ref<'a>(&'a self) -> &'a BIGNUM { &self.0 }
+pub struct Width<M> {
+    num_limbs: usize,
+
+    /// The modulus *m* that the width originated from.
+    m: PhantomData<M>,
 }
 
+/// All `BoxedLimbs<M>` are stored in the same number of limbs.
+struct BoxedLimbs<M> {
+    limbs: std::boxed::Box<[limb::Limb]>,
 
-/// Non-negative, non-zero integers.
-///
-/// This set is sometimes called `Natural` or `Counting`, but texts, libraries,
-/// and standards disagree on whether to include zero in them, so we avoid
-/// those names.
-pub struct Positive(Nonnegative);
+    /// The modulus *m* that determines the size of `limbx`.
+    m: PhantomData<M>,
+}
 
-impl Positive {
-    // Parses a single ASN.1 DER-encoded `Integer`, which most be positive.
-    #[cfg(feature = "rsa_signing")]
-    pub fn from_der(input: &mut untrusted::Reader)
-                    -> Result<Positive, error::Unspecified> {
-        Self::from_be_bytes(der::positive_integer(input)?)
+impl<M> Deref for BoxedLimbs<M> {
+    type Target = [limb::Limb];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.limbs
     }
+}
 
-    // Turns a sequence of big-endian bytes into a Positive Integer.
-    pub fn from_be_bytes(input: untrusted::Input)
-                         -> Result<Positive, error::Unspecified> {
+impl<M> DerefMut for BoxedLimbs<M> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.limbs
+    }
+}
+
+// TODO: `derive(Clone)` after https://github.com/rust-lang/rust/issues/26925
+// is resolved or restrict `M: Clone`.
+impl<M> Clone for BoxedLimbs<M> {
+    fn clone(&self) -> Self {
+        Self {
+            limbs: self.limbs.clone(),
+            m: self.m.clone(),
+        }
+    }
+}
+
+impl<M> BoxedLimbs<M> {
+    fn positive_minimal_width_from_be_bytes(input: untrusted::Input)
+                                            -> Result<Self, error::Unspecified> {
         // Reject leading zeros. Also reject the value zero ([0]) because zero
         // isn't positive.
         if untrusted::Reader::new(input).peek(0) {
             return Err(error::Unspecified);
         }
-        Self::from_be_bytes_padded(input)
-    }
-
-    pub fn from_be_bytes_padded(input: untrusted::Input)
-                                -> Result<Self, error::Unspecified> {
-        let r = Nonnegative::from_be_bytes_padded(input)?;
-        if r.is_zero() {
-            return Err(error::Unspecified);
-        }
-        Ok(Positive(r))
-    }
-
-    pub fn into_elem<M>(self, m: &Modulus<M>)
-                        -> Result<Elem<M, Unencoded>, error::Unspecified> {
-        self.0.into_elem(m)
-    }
-
-    pub fn into_odd_positive(self) -> Result<OddPositive, error::Unspecified> {
-        self.0.into_odd_positive()
-    }
-
-    #[inline]
-    pub fn bit_length(&self) -> bits::BitLength { self.0.bit_length() }
-}
-
-/// Odd positive integers.
-pub struct OddPositive(Positive);
-
-impl OddPositive {
-    #[cfg(feature = "rsa_signing")]
-    #[inline]
-    pub fn verify_less_than(&self, other: &Self)
-                            -> Result<(), error::Unspecified> {
-        (self.0).0.verify_less_than(&(other.0).0)
+        let num_limbs = (input.len() + limb::LIMB_BYTES - 1) / limb::LIMB_BYTES;
+        let mut r = Self::zero(Width { num_limbs, m: PhantomData });
+        limb::parse_big_endian_and_pad_consttime(input, &mut r)?;
+        Ok(r)
     }
 
     #[cfg(feature = "rsa_signing")]
-    pub fn try_clone(&self) -> Result<OddPositive, error::Unspecified> {
-        let value = (self.0).0.try_clone()?;
-        Ok(OddPositive(Positive(value)))
+    fn minimal_width_from_unpadded(limbs: &[limb::Limb]) -> Self {
+        debug_assert_ne!(limbs.last(), Some(&0));
+        use std::borrow::ToOwned;
+        Self {
+            limbs: limbs.to_owned().into_boxed_slice(),
+            m: PhantomData,
+        }
     }
 
-    #[cfg(feature = "rsa_signing")]
-    pub fn into_elem<M>(self, m: &Modulus<M>)
-                        -> Result<Elem<M, Unencoded>, error::Unspecified> {
-        self.0.into_elem(m)
+    fn from_be_bytes_padded_less_than(input: untrusted::Input, m: &Modulus<M>)
+                                      -> Result<Self, error::Unspecified> {
+        let mut r = Self::zero(m.width());
+        limb::parse_big_endian_and_pad_consttime(input, &mut r)?;
+        if limb::limbs_less_than_limbs_consttime(&r, &m.limbs) !=
+            limb::LimbMask::True {
+            return Err(error::Unspecified);
+        }
+        Ok(r)
     }
 
     #[inline]
-    pub fn into_modulus<M>(self) -> Result<Modulus<M>, error::Unspecified> {
-        Modulus::new(self)
+    fn is_zero(&self) -> bool {
+        limb::limbs_are_zero_constant_time(&self.limbs) == limb::LimbMask::True
     }
 
-    pub fn into_public_exponent(self)
-                                -> Result<PublicExponent, error::Unspecified> {
-        let bits = self.bit_length();
-        if bits < bits::BitLength::from_usize_bits(2) {
-            return Err(error::Unspecified);
+    fn zero(width: Width<M>) -> Self {
+        use std::borrow::ToOwned;
+        Self {
+            limbs: vec![0; width.num_limbs].to_owned().into_boxed_slice(),
+            m: PhantomData,
         }
-        if bits > PUBLIC_EXPONENT_MAX_BITS {
-            return Err(error::Unspecified);
+    }
+
+    fn width(&self) -> Width<M> {
+        Width {
+            num_limbs: self.limbs.len(),
+            m: PhantomData,
         }
-
-        let limbs = (self.0).0.limbs();
-
-        #[cfg(target_pointer_width = "64")]
-        let value = {
-            assert!(limbs.len() == 1);
-            *limbs.first().unwrap()
-        };
-
-        #[cfg(target_pointer_width = "32")]
-        let value = {
-            let mut value = u64::from(limbs[0]);
-            if limbs.len() > 1 {
-                assert!(limbs.len() == 2);
-                value |= u64::from(limbs[1]) << limb::LIMB_BITS;
-            };
-            value
-        };
-
-        Ok(PublicExponent(value))
     }
 }
-
-impl core::ops::Deref for OddPositive {
-    type Target = Positive;
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
 
 /// A modulus *s* that is smaller than another modulus *l* so every element of
 /// ℤ/sℤ is also an element of ℤ/lℤ.
@@ -187,13 +169,15 @@ pub unsafe trait SlightlySmallerModulus<L>: SmallerModulus<L> {}
 /// ℤ/sℤ.
 pub unsafe trait NotMuchSmallerModulus<L>: SmallerModulus<L> {}
 
+pub const MODULUS_MAX_LIMBS: usize = 8192 / limb::LIMB_BITS;
 
 /// The modulus *m* for a ring ℤ/mℤ, along with the precomputed values needed
 /// for efficient Montgomery multiplication modulo *m*. The value must be odd
 /// and larger than 2. The larger-than-1 requirement is imposed, at least, by
 /// the modular inversion code.
+#[derive(Clone)]
 pub struct Modulus<M> {
-    value: OddPositive, // Also `value >= 3`.
+    limbs: BoxedLimbs<M>, // Also `value >= 3`.
 
     // n0 * N == -1 (mod r).
     //
@@ -231,49 +215,102 @@ pub struct Modulus<M> {
     // ones that don't, we could use a shorter `R` value and use faster `Limb`
     // calculations instead of double-precision `u64` calculations.
     n0: N0,
-
-    m: PhantomData<M>,
 }
 
-// `Modulus` uniquely owns and references its contents.
-unsafe impl<M> Send for Modulus<M> {}
-
-// `Modulus` is immutable.
-unsafe impl<M> Sync for Modulus<M> {}
-
 impl<M> Modulus<M> {
-    fn new(n: OddPositive) -> Result<Self, error::Unspecified> {
-        // A `Modulus` must be larger than 1.
-        if n.bit_length() < bits::BitLength::from_usize_bits(2) {
+    pub fn from_be_bytes_with_bit_length(input: untrusted::Input)
+        -> Result<(Self, bits::BitLength), error::Unspecified>
+    {
+        let limbs = BoxedLimbs::positive_minimal_width_from_be_bytes(input)?;
+        let bits = minimal_limbs_bit_length(&limbs);
+        Ok((Self::from_boxed_limbs(limbs)?, bits))
+    }
+
+    #[cfg(feature = "rsa_signing")]
+    pub fn from(n: Nonnegative) -> Result<Self, error::Unspecified> {
+        Self::from_limbs(n.limbs())
+    }
+
+    #[cfg(feature = "rsa_signing")]
+    fn from_limbs(n: &[limb::Limb]) -> Result<Self, error::Unspecified> {
+        Self::from_boxed_limbs(BoxedLimbs::minimal_width_from_unpadded(n))
+    }
+
+    fn from_boxed_limbs(n: BoxedLimbs<M>) -> Result<Self, error::Unspecified> {
+        if n.len() > MODULUS_MAX_LIMBS {
+            return Err(error::Unspecified);
+        }
+        bssl::map_result(unsafe {
+            GFp_bn_mul_mont_check_num_limbs(n.len())
+        })?;
+        if limb::limbs_are_even_constant_time(&n) != limb::LimbMask::False {
+            return Err(error::Unspecified)
+        }
+        if limb::limbs_less_than_limb_constant_time(&n, 3) != limb::LimbMask::False {
             return Err(error::Unspecified);
         }
 
         // n_mod_r = n % r. As explained in the documentation for `n0`, this is
         // done by taking the lowest `N0_LIMBS_USED` limbs of `n`.
         let n0 = {
-            let n_limbs = (n.0).0.limbs();
-            let mut n_mod_r: u64 = u64::from(n_limbs[0]);
+            // XXX: u64::from isn't guaranteed to be constant time.
+            let mut n_mod_r: u64 = u64::from(n[0]);
 
             if N0_LIMBS_USED == 2 {
                 // XXX: If we use `<< limb::LIMB_BITS` here then 64-bit builds
                 // fail to compile because of `deny(exceeding_bitshifts)`.
                 debug_assert_eq!(limb::LIMB_BITS, 32);
-                n_mod_r |= u64::from(n_limbs[1]) << 32;
+                n_mod_r |= u64::from(n[1]) << 32;
             }
             unsafe { GFp_bn_neg_inv_mod_r_u64(n_mod_r) }
         };
 
         Ok(Modulus {
-            value: n,
+            limbs: n,
             n0: n0_from_u64(n0),
-            m: PhantomData,
         })
+    }
+
+    #[inline]
+    fn width(&self) -> Width<M> { self.limbs.width() }
+
+    pub fn zero<E>(&self) -> Elem<M, E> {
+        Elem {
+            limbs: BoxedLimbs::zero(self.width()),
+            encoding: PhantomData,
+        }
+    }
+
+    // TODO: Get rid of this
+    #[cfg(feature = "rsa_signing")]
+    fn one(&self) -> Elem<M, Unencoded> {
+        let mut r = self.zero();
+        r.limbs[0] = 1;
+        r
+    }
+
+    #[cfg(feature = "rsa_signing")]
+    pub fn to_elem<L>(&self, l: &Modulus<L>) -> Elem<L, Unencoded>
+        where M: SmallerModulus<L>
+    {
+        // TODO: Encode this assertion into the `where` above.
+        assert_eq!(self.width().num_limbs, l.width().num_limbs);
+        let limbs = self.limbs.clone();
+        Elem {
+            limbs: BoxedLimbs {
+                limbs: limbs.limbs,
+                m: PhantomData,
+            },
+            encoding: PhantomData,
+        }
     }
 }
 
-#[cfg(feature = "rsa_signing")]
-impl Modulus<super::N> {
-    pub fn value(&self) -> &OddPositive { &self.value }
+/// Allows writing generic algorithms that require constraining the result type
+/// of the multiplication.
+pub trait ModMul<B, M> {
+    type Output;
+    fn mod_mul(&self, b: B, m: &Modulus<M>) -> Self::Output;
 }
 
 /// Elements of ℤ/mℤ for some modulus *m*.
@@ -282,104 +319,121 @@ impl Modulus<super::N> {
 // submodule. However, for maximum clarity, we always explicitly use
 // `Unencoded` within the `bigint` submodule.
 pub struct Elem<M, E = Unencoded> {
-    value: Nonnegative,
-
-    /// The modulus *m* for the ring ℤ/mℤ for which this element is a value.
-    m: PhantomData<M>,
+    limbs: BoxedLimbs<M>,
 
     /// The number of Montgomery factors that need to be canceled out from
     /// `value` to get the actual value.
     encoding: PhantomData<E>,
 }
 
-impl<M, E> Elem<M, E> {
-    // There's no need to convert `value` to the Montgomery domain since
-    // 0 * R**2 (mod m) == 0, so the modulus isn't even needed to construct a
-    // zero-valued element.
-    pub fn zero() -> Result<Self, error::Unspecified> {
-        let value = Nonnegative::zero()?;
-        Ok(Elem {
-            value: value,
-            m: PhantomData,
-            encoding: PhantomData,
-        })
+// TODO: `derive(Clone)` after https://github.com/rust-lang/rust/issues/26925
+// is resolved or restrict `M: Clone` and `E: Clone`.
+impl<M, E> Clone for Elem<M, E> {
+    fn clone(&self) -> Self {
+        Elem {
+            limbs: self.limbs.clone(),
+            encoding: self.encoding.clone(),
+        }
     }
+}
 
-    #[cfg(feature = "rsa_signing")]
-    pub fn is_zero(&self) -> bool { self.value.is_zero() }
+impl<M, E> Elem<M, E> {
+    #[inline]
+    pub fn is_zero(&self) -> bool { self.limbs.is_zero() }
 
+    // XXX: This is nonsense semantically, but it is a useful optimization.
     #[cfg(feature = "rsa_signing")]
     pub fn take_storage<OtherF>(e: Elem<M, OtherF>) -> Elem<M, E> {
         Elem {
-            value: e.value,
-            m: PhantomData,
+            limbs: e.limbs,
             encoding: PhantomData,
         }
     }
+}
 
-    pub fn try_clone(&self) -> Result<Self, error::Unspecified> {
-        let value = self.value.try_clone()?;
-        Ok(Elem {
-            value: value,
-            m: PhantomData,
+impl<M, E: ReductionEncoding> Elem<M, E> {
+    fn decode_once(self, m: &Modulus<M>)
+        -> Elem<M, <E as ReductionEncoding>::Output>
+    {
+        // A multiplication isn't required since we're multiplying by the
+        // unencoded value one (1); only a Montgomery reduction is needed.
+        // However the only non-multiplication Montgomery reduction function we
+        // have requires the input to be large, so we avoid using it here.
+        let mut limbs = self.limbs;
+        let num_limbs = m.width().num_limbs;
+        let mut one = [0; MODULUS_MAX_LIMBS];
+        one[0] = 1;
+        let one = &one[..num_limbs]; // assert!(num_limbs <= MODULUS_MAX_LIMBS);
+        unsafe {
+            GFp_bn_mul_mont(limbs.as_mut_ptr(), limbs.as_ptr(),
+                            one.as_ptr(), m.limbs.as_ptr(), &m.n0, num_limbs)
+        }
+        Elem {
+            limbs,
             encoding: PhantomData,
-        })
+        }
     }
 }
 
 impl<M> Elem<M, R> {
     #[inline]
-    pub fn into_unencoded(self, m: &Modulus<M>)
-                          -> Result<Elem<M, Unencoded>, error::Unspecified> {
-        elem_reduced_(self, m)
+    pub fn into_unencoded(self, m: &Modulus<M>) -> Elem<M, Unencoded> {
+        self.decode_once(m)
     }
 }
 
 impl<M> Elem<M, Unencoded> {
-    #[cfg(feature = "rsa_signing")]
-    pub fn one() -> Result<Self, error::Unspecified> {
-        let value = Nonnegative::one()?;
+    pub fn from_be_bytes_padded(input: untrusted::Input, m: &Modulus<M>)
+                                -> Result<Self, error::Unspecified> {
         Ok(Elem {
-            value: value,
-            m: PhantomData,
+            limbs: BoxedLimbs::from_be_bytes_padded_less_than(input, m)?,
             encoding: PhantomData,
         })
     }
 
     #[inline]
     pub fn fill_be_bytes(&self, out: &mut [u8]) {
-        limb::big_endian_from_limbs_padded(self.value.limbs(), out)
+        limb::big_endian_from_limbs_padded(&self.limbs, out)
     }
-
-    #[cfg(feature = "rsa_signing")]
-    pub fn is_one(&self) -> bool { self.value.is_one() }
-
-    // The result is security-sensitive.
-    #[cfg(feature = "rsa_signing")]
-    #[inline]
-    pub fn bit_length(&self) -> bits::BitLength { self.value.bit_length() }
 
     #[cfg(feature = "rsa_signing")]
     pub fn into_modulus<MM>(self) -> Result<Modulus<MM>, error::Unspecified> {
-        let value = self.value.into_odd_positive()?;
-        value.into_modulus()
+        Modulus::from_limbs(&self.limbs)
     }
 }
 
-pub fn elem_mul<M, AF, BF>(a: &Elem<M, AF>, b: Elem<M, BF>, m: &Modulus<M>)
-        -> Result<Elem<M, <(AF, BF) as ProductEncoding>::Output>,
-                  error::Unspecified>
+#[cfg(feature = "rsa_signing")]
+impl<M> IsOne for Elem<M, Unencoded> {
+    fn is_one(&self) -> bool {
+        limb::limbs_equal_limb_constant_time(&self.limbs, 1) ==
+            limb::LimbMask::True
+    }
+}
+
+#[cfg(feature = "rsa_signing")]
+impl<AF, BF, M> ModMul<Elem<M, BF>, M> for Elem<M, AF>
+    where (AF, BF): ProductEncoding
+{
+    type Output = Elem<M, <(AF, BF) as ProductEncoding>::Output>;
+    fn mod_mul(&self, b: Elem<M, BF>, m: &Modulus<M>)
+        -> <Self as ModMul<Elem<M, BF>, M>>::Output
+    {
+        elem_mul(self, b, m)
+    }
+}
+
+pub fn elem_mul<M, AF, BF>(a: &Elem<M, AF>, mut b: Elem<M, BF>, m: &Modulus<M>)
+        -> Elem<M, <(AF, BF) as ProductEncoding>::Output>
         where (AF, BF): ProductEncoding {
-    let mut r = b.value;
-    bssl::map_result(unsafe {
-        GFp_BN_mod_mul_mont(&mut r.0, a.value.as_ref(), &r.0, &m.value.as_ref(),
-                            &m.n0)
-    })?;
-    Ok(Elem {
-        value: r,
-        m: PhantomData,
+    unsafe {
+        GFp_bn_mul_mont(b.limbs.as_mut_ptr(), a.limbs.as_ptr(),
+                        b.limbs.as_ptr(), m.limbs.as_ptr(), &m.n0,
+                        m.limbs.len());
+    }
+    Elem {
+        limbs: b.limbs,
         encoding: PhantomData,
-    })
+    }
 }
 
 // `a` * `b` (mod `m`).
@@ -387,31 +441,28 @@ pub fn elem_mul<M, AF, BF>(a: &Elem<M, AF>, b: Elem<M, BF>, m: &Modulus<M>)
 pub fn elem_set_to_product<M, AF, BF>(
         r: &mut Elem<M, <(AF, BF) as ProductEncoding>::Output>,
         a: &Elem<M, AF>, b: &Elem<M, BF>, m: &Modulus<M>)
-        -> Result<(), error::Unspecified>
         where (AF, BF): ProductEncoding {
-    bssl::map_result(unsafe {
-        GFp_BN_mod_mul_mont(r.value.as_mut_ref(), a.value.as_ref(),
-                            b.value.as_ref(), &m.value.as_ref(), &m.n0)
-    })
+    unsafe {
+        GFp_bn_mul_mont(r.limbs.as_mut_ptr(), a.limbs.as_ptr(),
+                        b.limbs.as_ptr(), m.limbs.as_ptr(), &m.n0,
+                        m.limbs.len())
+    }
 }
 
 #[cfg(feature = "rsa_signing")]
 pub fn elem_reduced_once<Larger, Smaller: SlightlySmallerModulus<Larger>>(
         a: &Elem<Larger, Unencoded>, m: &Modulus<Smaller>)
-        -> Result<Elem<Smaller, Unencoded>, error::Unspecified> {
-    let mut r = a.value.try_clone()?;
-    let m_limbs = (m.value.0).0.limbs();
-    assert!(r.limbs().len() <= m_limbs.len());
-    r.0.make_limbs(m_limbs.len(), |r_limbs| {
-        limb::limbs_reduce_once_constant_time(r_limbs, m_limbs);
-        Ok(())
-    })?;
-    debug_assert!(greater_than(&(m.value.0).0, &r));
-    Ok(Elem {
-        value: r,
-        m: PhantomData,
+        -> Elem<Smaller, Unencoded> {
+    let mut r = a.limbs.clone();
+    assert!(r.len() <= m.limbs.len());
+    limb::limbs_reduce_once_constant_time(&mut r, &m.limbs);
+    Elem {
+        limbs: BoxedLimbs {
+            limbs: r.limbs,
+            m: PhantomData,
+        },
         encoding: PhantomData,
-    })
+    }
 }
 
 #[cfg(feature = "rsa_signing")]
@@ -419,157 +470,120 @@ pub fn elem_reduced_once<Larger, Smaller: SlightlySmallerModulus<Larger>>(
 pub fn elem_reduced<Larger, Smaller: NotMuchSmallerModulus<Larger>>(
         a: &Elem<Larger, Unencoded>, m: &Modulus<Smaller>)
         -> Result<Elem<Smaller, RInverse>, error::Unspecified> {
-    let tmp = a.try_clone()?;
-    elem_reduced_(tmp, m)
-}
+    let mut tmp = [0; MODULUS_MAX_LIMBS];
+    let tmp = &mut tmp[..a.limbs.len()];
+    tmp.copy_from_slice(&a.limbs);
 
-fn elem_reduced_<LargerM, E: ReductionEncoding, SmallerM>(
-        mut a: Elem<LargerM, E>, m: &Modulus<SmallerM>)
-        -> Result<Elem<SmallerM, <E as ReductionEncoding>::Output>,
-                  error::Unspecified> {
-    let mut r = Elem::zero()?;
+    let mut r = m.zero();
     bssl::map_result(unsafe {
-        GFp_BN_from_montgomery_word(r.value.as_mut_ref(), a.value.as_mut_ref(),
-                                    &m.value.as_ref(), &m.n0)
+        GFp_bn_from_montgomery_in_place(r.limbs.as_mut_ptr(), r.limbs.len(),
+                                        tmp.as_mut_ptr(), tmp.len(),
+                                        m.limbs.as_ptr(), m.limbs.len(), &m.n0)
     })?;
     Ok(r)
 }
 
-pub fn elem_squared<M, E>(a: Elem<M, E>, m: &Modulus<M>)
-        -> Result<Elem<M, <(E, E) as ProductEncoding>::Output>,
-                  error::Unspecified>
+pub fn elem_squared<M, E>(mut a: Elem<M, E>, m: &Modulus<M>)
+        -> Elem<M, <(E, E) as ProductEncoding>::Output>
         where (E, E): ProductEncoding {
-    let mut value = a.value;
-    bssl::map_result(unsafe {
-        GFp_BN_mod_mul_mont(value.as_mut_ref(), value.as_ref(), value.as_ref(),
-                            &m.value.as_ref(), &m.n0)
-    })?;
-    Ok(Elem {
-        value: value,
-        m: PhantomData,
+    unsafe {
+        GFp_bn_mul_mont(a.limbs.as_mut_ptr(), a.limbs.as_ptr(),
+                        a.limbs.as_ptr(), m.limbs.as_ptr(), &m.n0,
+                        m.limbs.len());
+    };
+    Elem {
+        limbs: a.limbs,
         encoding: PhantomData,
-    })
+    }
 }
 
 #[cfg(feature = "rsa_signing")]
 pub fn elem_widen<Larger, Smaller: SmallerModulus<Larger>>(
-        a: Elem<Smaller, Unencoded>) -> Elem<Larger, Unencoded> {
-    Elem {
-        value: a.value,
-        m: PhantomData,
-        encoding: PhantomData,
-    }
+    a: Elem<Smaller, Unencoded>, m: &Modulus<Larger>)
+    -> Elem<Larger, Unencoded>
+{
+    let mut r = m.zero();
+    r.limbs[..a.limbs.len()].copy_from_slice(&a.limbs);
+    r
 }
 
 
 // TODO: Document why this works for all Montgomery factors.
 #[cfg(feature = "rsa_signing")]
-pub fn elem_add<M, E>(mut a: Elem<M, E>, mut b: Elem<M, E>, m: &Modulus<M>)
-                      -> Result<Elem<M, E>, error::Unspecified> {
-    let m = (m.value.0).0.limbs();
-    a.value.0.make_limbs(m.len(), |a_limbs| {
-        b.value.0.make_limbs(m.len(), |b_limbs| {
-            unsafe {
-                LIMBS_add_mod(a_limbs.as_mut_ptr(), a_limbs.as_ptr(),
-                              b_limbs.as_ptr(), m.as_ptr(), m.len())
-            }
-            Ok(())
-        })
-    })?;
-    Ok(a)
+pub fn elem_add<M, E>(mut a: Elem<M, E>, b: Elem<M, E>, m: &Modulus<M>)
+    -> Elem<M, E>
+{
+    unsafe {
+        LIMBS_add_mod(a.limbs.as_mut_ptr(), a.limbs.as_ptr(),
+                      b.limbs.as_ptr(), m.limbs.as_ptr(), m.limbs.len())
+    }
+    a
 }
 
 // TODO: Document why this works for all Montgomery factors.
 #[cfg(feature = "rsa_signing")]
 pub fn elem_sub<M, E>(mut a: Elem<M, E>, b: &Elem<M, E>, m: &Modulus<M>)
-                   -> Result<Elem<M, E>, error::Unspecified> {
-    let m_limbs = (m.value.0).0.limbs();
-    a.value.0.make_limbs(m_limbs.len(), |a_limbs| {
-        let b_limbs = b.value.limbs();
-        unsafe {
-            // XXX Not constant-time, even though it looks like it might be.
-            LIMBS_sub_mod_ex(a_limbs.as_mut_ptr(), b_limbs.as_ptr(),
-                             m_limbs.as_ptr(), m_limbs.len(), b_limbs.len())
-        }
-        Ok(())
-    })?;
-    Ok(a)
+    -> Elem<M, E>
+{
+    unsafe {
+        LIMBS_sub_mod(a.limbs.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr(),
+                      m.limbs.as_ptr(), m.limbs.len());
+    }
+    a
 }
 
 
 // The value 1, Montgomery-encoded some number of times.
+#[derive(Clone)]
 pub struct One<M, E>(Elem<M, E>);
 
 #[cfg(feature = "rsa_signing")]
 impl<M> One<M, R> {
-    pub fn newR(oneRR: &One<M, RR>, m: &Modulus<M>)
-                -> Result<One<M, R>, error::Unspecified> {
-        let value: Elem<M> = Elem::one()?;
-        let value: Elem<M, R> = elem_mul(oneRR.as_ref(), value, &m)?;
-        Ok(One(value))
+    pub fn newR(oneRR: &One<M, RR>, m: &Modulus<M>) -> One<M, R> {
+        One(oneRR.0.clone().decode_once(m))
     }
 }
 
 impl<M> One<M, RR> {
-    pub fn newRR(m: &Modulus<M>) -> Result<One<M, RR>, error::Unspecified> {
-        let RR = calculate_RR(&(m.value.0).0)?;
-        Ok(One(Elem {
-            value: RR,
-            m: PhantomData,
-            encoding: PhantomData,
-        }))
-    }
-}
+    // Returns 2**(lg R) (mod m).
+    //
+    // RR = R**2 (mod N). R is the smallest power of 2**LIMB_BITS such that R > m.
+    // Even though the assembly on some 32-bit platforms works with 64-bit values,
+    // using `LIMB_BITS` here, rather than `N0_LIMBS_USED * LIMB_BITS`, is correct
+    // because R**2 will still be a multiple of the latter as `N0_LIMBS_USED` is
+    // either one or two.
+    pub fn newRR(m: &Modulus<M>) -> One<M, RR> {
+        use limb::LIMB_BITS;
 
-// Returns 2**(lg R) (mod m).
-//
-// RR = R**2 (mod N). R is the smallest power of 2**LIMB_BITS such that R > m.
-// Even though the assembly on some 32-bit platforms works with 64-bit values,
-// using `LIMB_BITS` here, rather than `N0_LIMBS_USED * LIMB_BITS`, is correct
-// because R**2 will still be a multiple of the latter as `N0_LIMBS_USED` is
-// either one or two.
-fn calculate_RR(m: &Nonnegative) -> Result<Nonnegative, error::Unspecified> {
-    use limb::LIMB_BITS;
+        let m_bits = minimal_limbs_bit_length(&m.limbs).as_usize_bits();
 
-    let m_bits = m.bit_length().as_usize_bits();
+        let lg_RR = ((m_bits + (LIMB_BITS - 1)) / LIMB_BITS * LIMB_BITS) * 2;
 
-    let lg_RR = ((m_bits + (LIMB_BITS - 1)) / LIMB_BITS * LIMB_BITS) * 2;
-
-    let mut r = Nonnegative::zero()?;
-
-    let num_limbs = m.limbs().len();
-
-    r.as_mut_ref().make_limbs(num_limbs, |limbs| {
-        // Zero all the limbs.
-        for limb in limbs.iter_mut() {
-            *limb = 0;
-        }
+        let mut r = m.zero();
 
         // Make `r` the highest power of 2 less than `m`.
         let bit = m_bits - 1;
-        limbs[bit / LIMB_BITS] = 1 << (bit % LIMB_BITS);
+        r.limbs[bit / LIMB_BITS] = 1 << (bit % LIMB_BITS);
+
+        let num_limbs = r.limbs.len();
 
         // Double the value (mod m) until it is 2**(lg RR) (mod m),
         // i.e. RR (mod m).
         for _ in bit..lg_RR {
             unsafe {
-                LIMBS_shl_mod(limbs.as_mut_ptr(), limbs.as_ptr(),
-                              m.limbs().as_ptr(), num_limbs);
+                LIMBS_shl_mod(r.limbs.as_mut_ptr(), r.limbs.as_ptr(),
+                              m.limbs.as_ptr(), num_limbs);
             }
         }
 
-        Ok(())
-    })?;
-
-    Ok(r)
+        One(r)
+    }
 }
 
 #[cfg(feature = "rsa_signing")]
 impl<M> One<M, RRR> {
-    pub fn newRRR(oneRR: One<M, RR>, m: &Modulus<M>)
-                  -> Result<One<M, RRR>, error::Unspecified> {
-        let oneRRR = elem_squared(oneRR.0, &m)?;
-        Ok(One(oneRRR))
+    pub fn newRRR(oneRR: One<M, RR>, m: &Modulus<M>) -> One<M, RRR> {
+        One(elem_squared(oneRR.0, &m))
     }
 }
 
@@ -577,19 +591,44 @@ impl<M, E> AsRef<Elem<M, E>> for One<M, E> {
     fn as_ref(&self) -> &Elem<M, E> { &self.0 }
 }
 
-#[cfg(feature = "rsa_signing")]
-impl<M, E> One<M, E> {
-    pub fn try_clone(&self) -> Result<Self, error::Unspecified> {
-        let value = self.0.try_clone()?;
-        Ok(One(value))
-    }
-}
-
-
 /// An non-secret odd positive value in the range
-/// [3, 2**PUBLIC_EXPONENT_MAX_BITS).
+/// [3, PUBLIC_EXPONENT_MAX_VALUE].
 #[derive(Clone, Copy)]
 pub struct PublicExponent(u64);
+
+impl PublicExponent {
+    pub fn from_be_bytes(input: untrusted::Input, min_value: u64)
+                         -> Result<Self, error::Unspecified> {
+        if input.len() > 5 {
+            return Err(error::Unspecified);
+        }
+        let value = input.read_all_mut(error::Unspecified, |input| {
+            // The exponent can't be zero and it can't be prefixed with
+            // zero-valued bytes.
+            if input.peek(0) {
+                return Err(error::Unspecified);
+            }
+            let mut value = 0u64;
+            loop {
+                let byte = input.read_byte()?;
+                value = (value << 8) | u64::from(byte);
+                if input.at_end() {
+                    return Ok(value);
+                }
+            }
+        })?;
+        if value & 1 != 1 {
+            return Err(error::Unspecified);
+        }
+        if value < min_value {
+            return Err(error::Unspecified);
+        }
+        if value > PUBLIC_EXPONENT_MAX_VALUE {
+            return Err(error::Unspecified);
+        }
+        Ok(PublicExponent(value))
+    }
+}
 
 // This limit was chosen to bound the performance of the simple
 // exponentiation-by-squaring implementation in `elem_exp_vartime`. In
@@ -602,14 +641,14 @@ pub struct PublicExponent(u64);
 // [1] https://www.imperialviolet.org/2012/03/16/rsae.html
 // [2] https://www.imperialviolet.org/2012/03/17/rsados.html
 // [3] https://msdn.microsoft.com/en-us/library/aa387685(VS.85).aspx
-pub const PUBLIC_EXPONENT_MAX_BITS: bits::BitLength = bits::BitLength(33);
+pub const PUBLIC_EXPONENT_MAX_VALUE: u64 = (1u64 << 33) - 1;
 
 /// Calculates base**exponent (mod m).
 // TODO: The test coverage needs to be expanded, e.g. test with the largest
 // accepted exponent and with the most common values of 65537 and 3.
 pub fn elem_exp_vartime<M>(
         base: Elem<M, R>, PublicExponent(exponent): PublicExponent,
-        m: &Modulus<M>) -> Result<Elem<M, R>, error::Unspecified> {
+        m: &Modulus<M>) -> Elem<M, R> {
     // Use what [Knuth] calls the "S-and-X binary method", i.e. variable-time
     // square-and-multiply that scans the exponent from the most significant
     // bit to the least significant bit (left-to-right). Left-to-right requires
@@ -622,7 +661,7 @@ pub fn elem_exp_vartime<M>(
     // efficient algorithm the hamming weight is 2 or less. It isn't the most
     // efficient for all other, uncommon, RSA public exponent values weight,
     // but any suboptimality is tightly bounded by the
-    // `PUBLIC_EXPONENT_MAX_BITS` cap.
+    // `PUBLIC_EXPONENT_MAX_VALUE` cap.
     //
     // This implementation is slightly simplified by taking advantage of the
     // fact that we require the exponent to be an (odd) positive integer.
@@ -630,38 +669,80 @@ pub fn elem_exp_vartime<M>(
     // [Knuth]: The Art of Computer Programming, Volume 2: Seminumerical
     //          Algorithms (3rd Edition), Section 4.6.3.
     debug_assert_eq!(exponent & 1, 1);
-    assert!(exponent < (1 << PUBLIC_EXPONENT_MAX_BITS.as_usize_bits()));
-    let mut acc = base.try_clone()?;
+    assert!(exponent <= PUBLIC_EXPONENT_MAX_VALUE);
+    let mut acc = base.clone();
     let mut bit = 1 << (64 - 1 - exponent.leading_zeros());
     debug_assert!((exponent & bit) != 0);
     while bit > 1 {
         bit >>= 1;
-        acc = elem_squared(acc, m)?;
+        acc = elem_squared(acc, m);
         if (exponent & bit) != 0 {
-            acc = elem_mul(&base, acc, m)?;
+            acc = elem_mul(&base, acc, m);
         }
     }
-    Ok(acc)
+    acc
+}
+
+// `M` represents the prime modulus for which the exponent is in the interval
+// [1, `m` - 1).
+#[cfg(feature = "rsa_signing")]
+#[derive(Clone)]
+pub struct PrivateExponent<M> {
+    limbs: BoxedLimbs<M>,
+}
+
+#[cfg(feature = "rsa_signing")]
+impl<M> PrivateExponent<M> {
+    pub fn from_be_bytes_padded(input: untrusted::Input, p: &Modulus<M>)
+                                -> Result<Self, error::Unspecified> {
+        let dP = BoxedLimbs::from_be_bytes_padded_less_than(input, p)?;
+
+        // Proof that `dP < p - 1`:
+        //
+        // If `dP < p` then either `dP == p - 1` or `dP < p - 1`. Since `p` is
+        // odd, `p - 1` is even. `d` is odd, and an odd number modulo an even
+        // number is odd. Therefore `dP` must be odd. But then it cannot be
+        // `p - 1` and so we know `dP < p - 1`.
+        //
+        // Further we know `dP != 0` because `dP` is not even.
+        if limb::limbs_are_even_constant_time(&dP) != limb::LimbMask::False {
+            return Err(error::Unspecified);
+        }
+
+        Ok(PrivateExponent {
+            limbs: dP,
+        })
+    }
+}
+
+#[cfg(feature = "rsa_signing")]
+impl<M: Prime> PrivateExponent<M> {
+    // Returns `p - 2`.
+    fn for_flt(p: &Modulus<M>) -> Self {
+        let two = elem_add(p.one(), p.one(), p);
+        let p_minus_2 = elem_sub(p.zero(), &two, p);
+        PrivateExponent {
+            limbs: p_minus_2.limbs,
+        }
+    }
 }
 
 #[cfg(feature = "rsa_signing")]
 pub fn elem_exp_consttime<M>(
-        base: Elem<M, R>, exponent: &OddPositive, oneR: &One<M, R>,
+        base: Elem<M, R>, exponent: &PrivateExponent<M>, oneR: &One<M, R>,
         m: &Modulus<M>) -> Result<Elem<M, Unencoded>, error::Unspecified> {
-    let mut r = base.value;
-    bssl::map_result(unsafe {
-        GFp_BN_mod_exp_mont_consttime(&mut r.0, &r.0, exponent.as_ref(),
-                                      exponent.0.bit_length().as_usize_bits(),
-                                      oneR.0.value.as_ref(), &m.value.as_ref(),
-                                      &m.n0)
-    })?;
-    let r = Elem {
-        value: r,
-        m: PhantomData,
+    let mut r = Elem {
+        limbs: base.limbs,
         encoding: PhantomData,
     };
+    bssl::map_result(unsafe {
+        GFp_BN_mod_exp_mont_consttime(r.limbs.as_mut_ptr(), r.limbs.as_ptr(),
+                                      exponent.limbs.as_ptr(),
+                                      oneR.0.limbs.as_ptr(), m.limbs.as_ptr(),
+                                      m.limbs.len(), &m.n0)
+    })?;
 
-    // XXX: On x86-64 only, `GFp_BN_mod_exp_mont_consttime` dues the conversion
+    // XXX: On x86-64 only, `GFp_BN_mod_exp_mont_consttime` does the conversion
     // from Montgomery form itself using a special assembly-language reduction
     // function. This means that at this point, whether `r` is Montgomery
     // encoded, and the exact type of `R` (in particular, its `E` type
@@ -671,16 +752,39 @@ pub fn elem_exp_consttime<M>(
     // practical.
 
     #[cfg(not(target_arch = "x86_64"))]
-    let r = r.into_unencoded(m)?;
+    let r = r.into_unencoded(m);
 
     Ok(r)
+}
+
+/// Uses Fermat's Little Theorem to calculate modular inverse in constant time.
+#[cfg(feature = "rsa_signing")]
+pub fn elem_inverse_consttime<M: Prime>(
+        a: Elem<M, R>,
+        m: &Modulus<M>,
+        oneR: &One<M, R>) -> Result<Elem<M, Unencoded>, error::Unspecified> {
+    elem_exp_consttime(a, &PrivateExponent::for_flt(&m), oneR, m)
 }
 
 #[cfg(feature = "rsa_signing")]
 pub fn elem_randomize<E>(a: &mut Elem<super::N, E>, m: &Modulus<super::N>,
                          rng: &rand::SecureRandom)
                          -> Result<(), error::Unspecified> {
-    a.value.randomize(m, rng)
+    super::random::set_to_rand_mod(&mut a.limbs, &m.limbs, rng)
+}
+
+/// Verified a == b**-1 (mod m), i.e. a**-1 == b (mod m).
+#[cfg(feature = "rsa_signing")]
+pub fn verify_inverses_consttime<M, A, B>(a: &A, b: B, m: &Modulus<M>)
+    -> Result<(), error::Unspecified> where
+    A: ModMul<B, M>,
+    <A as ModMul<B, M>>::Output: IsOne
+{
+    if a.mod_mul(b, m).is_one() {
+        Ok(())
+    } else {
+        Err(error::Unspecified)
+    }
 }
 
 // r = 1/a (mod m), blinded with a random element.
@@ -692,12 +796,15 @@ pub fn elem_set_to_inverse_blinded(
             r: &mut Elem<super::N, R>, a: &Elem<super::N, Unencoded>,
             n: &Modulus<super::N>, rng: &rand::SecureRandom)
             -> Result<(), InversionError> {
-    let mut blinding_factor = Elem::<super::N, R>::zero()?;
-    elem_randomize(&mut blinding_factor, n, rng)?;
-    let to_blind = a.try_clone()?;
-    let blinded = elem_mul(&blinding_factor, to_blind, n)?;
+    let blinding_factor = {
+        let mut tmp = n.zero::<R>();
+        elem_randomize(&mut tmp, n, rng)?;
+        tmp
+    };
+    let to_blind = a.clone();
+    let blinded = elem_mul(&blinding_factor, to_blind, n);
     let blinded_inverse = elem_inverse(blinded, n)?;
-    elem_set_to_product(r, &blinding_factor, &blinded_inverse, n)?;
+    elem_set_to_product(r, &blinding_factor, &blinded_inverse, n);
     Ok(())
 }
 
@@ -708,30 +815,28 @@ pub fn elem_set_to_inverse_blinded(
 #[cfg(feature = "rsa_signing")]
 fn elem_inverse<M>(a: Elem<M, Unencoded>, m: &Modulus<M>)
                    -> Result<Elem<M, R>, InversionError> {
-    let a_clone = a.try_clone()?;
-    let inverse = nonnegative_mod_inverse(a.value, &(m.value.0).0)?;
+    let inverse = nonnegative_mod_inverse(Nonnegative::from_limbs(&a.limbs)?,
+                                          &m.limbs)?;
     let r: Elem<M, R> = Elem {
-        value: inverse,
-        m: PhantomData,
+        // TODO: The check done by to_elem() isn't necessary, right?
+        limbs: inverse.to_elem(&m)?.limbs,
         encoding: PhantomData,
     };
-
-    // Fail safe: Verify a * r == 1 (mod m).
-    let check = elem_mul(&r, a_clone, m)?;
-    assert!(check.is_one());
-
+    verify_inverses_consttime(&r, a, m)?;
     Ok(r)
 }
 
 #[cfg(feature = "rsa_signing")]
-fn nonnegative_mod_inverse(a: Nonnegative, m: &Nonnegative)
+fn nonnegative_mod_inverse(a: Nonnegative, m_limbs: &[limb::Limb])
                            -> Result<Nonnegative, InversionError> {
+    let m = Nonnegative::from_limbs(m_limbs)?;
+
     use limb::*;
 
     // Algorithm 2.23 from "Guide to Elliptic Curve Cryptography" [2004] by
     // Darrel Hankerson, Alfred Menezes, and Scott Vanstone.
 
-    debug_assert!(greater_than(m, &a));
+    debug_assert!(greater_than(&m, &a));
     if a.is_zero() {
         return Err(InversionError::NoInverse);
     }
@@ -799,12 +904,11 @@ fn nonnegative_mod_inverse(a: Nonnegative, m: &Nonnegative)
     }
 
     let mut u = a;
-    let mut v = m.try_clone()?;
+    let mut v = Nonnegative::from_limbs(m_limbs)?; // TODO: avoid clone
     let mut x1 = Nonnegative::one()?;
     let mut x2 = Nonnegative::zero()?;
     let mut k = 0;
 
-    let m_limbs = m.limbs();
     let m_limb_count = m_limbs.len();
 
     while !v.is_zero() {
@@ -833,7 +937,7 @@ fn nonnegative_mod_inverse(a: Nonnegative, m: &Nonnegative)
     }
 
     // Reduce `x1` once if necessary to ensure it is less than `m`.
-    if !greater_than(m, &x1) {
+    if !greater_than(&m, &x1) {
         debug_assert!(x1.limbs().len() <= m_limb_count + 1);
         // If `x` is longer than `m` then chop off that top bit.
         x1.0.make_limbs(m_limb_count, |x1_limbs| {
@@ -844,11 +948,11 @@ fn nonnegative_mod_inverse(a: Nonnegative, m: &Nonnegative)
             Ok(())
         })?;
     }
-    assert!(greater_than(m, &x1));
+    assert!(greater_than(&m, &x1));
 
     // Use the simpler repeated-subtraction reduction in 2.23.
 
-    let n = m.bit_length().as_usize_bits();
+    let n = minimal_limbs_bit_length(m.limbs()).as_usize_bits();
     assert!(k >= n);
     for _ in n..k {
         let mut carry = 0;
@@ -893,16 +997,15 @@ impl From<error::Unspecified> for InversionError {
 pub fn elem_verify_equal_consttime<M, E>(a: &Elem<M, E>, b: &Elem<M, E>)
                                          -> Result<(), error::Unspecified> {
     // XXX: Not constant-time if the number of limbs in `a` and `b` differ.
-    constant_time::verify_slices_are_equal(limb::limbs_as_bytes(a.value.limbs()),
-                                           limb::limbs_as_bytes(b.value.limbs()))
+    constant_time::verify_slices_are_equal(limb::limbs_as_bytes(&a.limbs),
+                                           limb::limbs_as_bytes(&b.limbs))
 }
 
-/// Nonnegative integers: `Positive` ∪ {0}.
-struct Nonnegative(BIGNUM);
+/// Nonnegative integers.
+#[cfg(feature = "rsa_signing")]
+pub struct Nonnegative(BIGNUM);
 
-// `Nonnegative` uniquely owns and references its contents.
-unsafe impl Send for Nonnegative {}
-
+#[cfg(feature = "rsa_signing")]
 impl Nonnegative {
     fn zero() -> Result<Self, error::Unspecified> {
         let r = Nonnegative(BIGNUM::zero());
@@ -910,7 +1013,17 @@ impl Nonnegative {
         Ok(r)
     }
 
-    #[cfg(feature = "rsa_signing")]
+    fn from_limbs(source: &[limb::Limb])
+        -> Result<Self, error::Unspecified>
+    {
+        let mut r = Self::zero()?;
+        r.0.make_limbs(source.len(), |limbs| {
+            limbs.copy_from_slice(source);
+            Ok(())
+        })?;
+        Ok(r)
+    }
+
     fn one() -> Result<Self, error::Unspecified> {
         let mut r = Self::zero()?;
         r.0.make_limbs(1, |limbs| {
@@ -920,51 +1033,36 @@ impl Nonnegative {
         Ok(r)
     }
 
-    pub fn from_be_bytes_padded(input: untrusted::Input)
-                                -> Result<Self, error::Unspecified> {
+    pub fn from_be_bytes_with_bit_length(input: untrusted::Input)
+        -> Result<(Self, bits::BitLength), error::Unspecified> {
         let mut r = Self::zero()?;
         r.0.make_limbs(
-            ((input.len() * limb::LIMB_BYTES) + limb::LIMB_BYTES - 1) /
-                limb::LIMB_BYTES, |limbs|  {
+            (input.len() + limb::LIMB_BYTES - 1) / limb::LIMB_BYTES, |limbs|  {
             // Rejects empty inputs.
             limb::parse_big_endian_and_pad_consttime(input, limbs)
         })?;
-        Ok(r)
+        let r_bits = minimal_limbs_bit_length(r.limbs());
+        Ok((r, r_bits))
     }
 
     #[inline]
     fn is_zero(&self) -> bool { self.limbs().is_empty() }
 
-    #[cfg(feature = "rsa_signing")]
-    fn is_one(&self) -> bool { self.limbs() == &[1] }
-
-    #[cfg(feature = "rsa_signing")]
     #[inline]
     fn is_even(&self) -> bool { !self.is_odd() }
 
     #[inline]
-    fn is_odd(&self) -> bool {
-        self.limbs().first().unwrap_or(&0) & 1 == 1
-    }
-
-    fn bit_length(&self) -> bits::BitLength {
-        let limbs = self.limbs();
-        // XXX: This assumes `Limb::leading_zeros()` is constant-time.
-        let high_bits = limbs.last()
-            .map_or(0, |high_limb|
-                limb::LIMB_BITS - (high_limb.leading_zeros() as usize));
-        bits::BitLength::from_usize_bits(
-            ((limbs.len() - 1) * limb::LIMB_BITS) + high_bits)
+    pub fn is_odd(&self) -> bool {
+        limb::limbs_are_even_constant_time(self.limbs()) == limb::LimbMask::False
     }
 
     #[inline]
     fn limbs(&self) -> &[limb::Limb] { self.0.limbs() }
 
-    #[cfg(feature = "rsa_signing")]
     #[inline]
     fn limbs_mut(&mut self) -> &mut [limb::Limb] { self.0.limbs_mut() }
 
-    fn verify_less_than(&self, other: &Self)
+    pub fn verify_less_than(&self, other: &Self)
                         -> Result<(), error::Unspecified> {
         if !greater_than(other, self) {
             return Err(error::Unspecified);
@@ -972,46 +1070,57 @@ impl Nonnegative {
         Ok(())
     }
 
-    #[cfg(feature = "rsa_signing")]
-    fn randomize(&mut self, m: &Modulus<super::N>, rng: &rand::SecureRandom)
-                 -> Result<(), error::Unspecified> {
-        let m = (m.value.0).0.limbs();
-        self.0.make_limbs(m.len(), |limbs| {
-            super::random::set_to_rand_mod(limbs, m, rng)
-        })
+    pub fn to_elem<M>(&self, m: &Modulus<M>)
+                      -> Result<Elem<M, Unencoded>, error::Unspecified> {
+        self.verify_less_than_modulus(&m)?;
+        let mut r = m.zero();
+        r.limbs[0..self.limbs().len()].copy_from_slice(self.limbs());
+        Ok(r)
     }
 
-    // XXX: This makes it too easy to break invariants on things. TODO: Remove
-    // this ASAP.
-    fn as_mut_ref(&mut self) -> &mut BIGNUM { &mut self.0 }
-
-    fn into_elem<M>(self, m: &Modulus<M>)
-                    -> Result<Elem<M, Unencoded>, error::Unspecified> {
-        self.verify_less_than(&(m.value.0).0)?;
-        Ok(Elem {
-            value: self,
-            m: PhantomData,
-            encoding: PhantomData,
-        })
-    }
-
-    fn into_odd_positive(self) -> Result<OddPositive, error::Unspecified> {
-        if !self.is_odd() {
+    pub fn verify_less_than_modulus<M>(&self, m: &Modulus<M>)
+                                       -> Result<(), error::Unspecified>
+    {
+        if self.limbs().len() > m.limbs.len() {
             return Err(error::Unspecified);
         }
-        Ok(OddPositive(Positive(self)))
-    }
-
-    pub fn try_clone(&self) -> Result<Nonnegative, error::Unspecified> {
-        let mut r = Nonnegative::zero()?;
-        bssl::map_result(unsafe {
-            GFp_BN_copy(r.as_mut_ref(), self.as_ref())
-        })?;
-        Ok(r)
+        if self.limbs().len() == m.limbs.len() {
+            if limb::limbs_less_than_limbs_consttime(self.limbs(), &m.limbs)
+                != limb::LimbMask::True {
+                return Err(error::Unspecified)
+            }
+        }
+        return Ok(())
     }
 }
 
+#[cfg(feature = "rsa_signing")]
+impl IsOne for Nonnegative {
+    fn is_one(&self) -> bool {
+        limb::limbs_equal_limb_constant_time(self.limbs(), 1) ==
+            limb::LimbMask::True
+    }
+}
+
+// Returns the number of bits in `a` assuming that the top word of `a` is not
+// zero.
+fn minimal_limbs_bit_length(a: &[limb::Limb]) -> bits::BitLength {
+    let bits = match a.last() {
+        Some(limb) => {
+            assert_ne!(*limb, 0);
+            // XXX: This assumes `Limb::leading_zeros()` is constant-time.
+            let high_bits = a.last().map_or(0, |high_limb| {
+                limb::LIMB_BITS - (high_limb.leading_zeros() as usize)
+            });
+            ((a.len() - 1) * limb::LIMB_BITS) + high_bits
+        },
+        None => 0,
+    };
+    bits::BitLength::from_usize_bits(bits)
+}
+
 // Returns a > b.
+#[cfg(feature = "rsa_signing")]
 fn greater_than(a: &Nonnegative, b: &Nonnegative) -> bool {
     let a_limbs = a.limbs();
     let b_limbs = b.limbs();
@@ -1045,6 +1154,7 @@ fn n0_from_u64(n0: u64) -> N0 {
 
 // `BIGNUM` is defined in its own submodule so that its private components are
 // not accessible.
+#[cfg(feature = "rsa_signing")]
 mod repr_c {
     use {bssl, c, error, limb};
     use core;
@@ -1056,15 +1166,10 @@ mod repr_c {
         d: *mut limb::Limb,
         top: c::int,
         dmax: c::int,
-        flags: c::int,
     }
 
     impl Drop for BIGNUM {
         fn drop(&mut self) {
-            // Keep this in sync with `GFp_BN_free()`.
-
-            // In particular, this doesn't work for `BN_FLG_STATIC_DATA`.
-            assert_eq!(self.flags, 0);
             unsafe {
                 let d: *mut limb::Limb = self.d;
                 libc::free(d as *mut libc::c_void)
@@ -1078,7 +1183,6 @@ mod repr_c {
                 d: core::ptr::null_mut(),
                 top: 0,
                 dmax: 0,
-                flags: 0,
             }
         }
 
@@ -1096,7 +1200,6 @@ mod repr_c {
             }
         }
 
-        #[cfg(feature = "rsa_signing")]
         pub fn grow_by_one_bit(&mut self) -> Result<(), error::Unspecified> {
             let old_top = self.top;
             let new_top = old_top + 1;
@@ -1108,7 +1211,6 @@ mod repr_c {
             Ok(())
         }
 
-        #[cfg(feature = "rsa_signing")]
         pub fn shrunk_by_at_most_one_bit(&mut self) {
             if self.limbs().last().map_or(false, |last| *last == 0) {
                 self.top -= 1;
@@ -1150,17 +1252,15 @@ mod repr_c {
     }
 }
 
+#[cfg(feature = "rsa_signing")]
 pub use self::repr_c::BIGNUM;
 
 versioned_extern! {
     // `r` and/or 'a' and/or 'b' may alias.
-    fn GFp_BN_mod_mul_mont(r: *mut BIGNUM, a: *const BIGNUM, b: *const BIGNUM,
-                            n: &BIGNUM, n0: &N0) -> c::int;
-
-    // The use of references here implies lack of aliasing.
-    fn GFp_BN_copy(a: &mut BIGNUM, b: &BIGNUM) -> c::int;
-    fn GFp_BN_from_montgomery_word(r: &mut BIGNUM, a: &mut BIGNUM, n: &BIGNUM,
-                                   n0: &N0) -> c::int;
+    fn GFp_bn_mul_mont(r: *mut limb::Limb, a: *const limb::Limb,
+                       b: *const limb::Limb, n: *const limb::Limb,
+                       n0: &N0, num_limbs: c::size_t);
+    fn GFp_bn_mul_mont_check_num_limbs(num_limbs: c::size_t) -> c::int;
 
     fn GFp_bn_neg_inv_mod_r_u64(n: u64) -> u64;
 
@@ -1170,19 +1270,26 @@ versioned_extern! {
 
 #[cfg(feature = "rsa_signing")]
 versioned_extern! {
+    fn GFp_bn_from_montgomery_in_place(r: *mut limb::Limb, num_r: c::size_t,
+                                       a: *mut limb::Limb, num_a: c::size_t,
+                                       n: *const limb::Limb, num_n: c::size_t,
+                                       n0: &N0) -> c::int;
+
     // `r` and `a` may alias.
-    fn GFp_BN_mod_exp_mont_consttime(r: *mut BIGNUM, a_mont: *const BIGNUM,
-                                     p: &BIGNUM, p_bits: c::size_t,
-                                     one_mont: &BIGNUM, n: &BIGNUM,
-                                     n0: &N0) -> c::int;
+    fn GFp_BN_mod_exp_mont_consttime(r: *mut limb::Limb,
+                                     a_mont: *const limb::Limb,
+                                     p: *const limb::Limb,
+                                     one_mont: *const limb::Limb,
+                                     n: *const limb::Limb,
+                                     num_limbs: c::size_t, n0: &N0) -> c::int;
 
     // `r` and `a` may alias.
     fn LIMBS_add_mod(r: *mut limb::Limb, a: *const limb::Limb,
                      b: *const limb::Limb, m: *const limb::Limb,
                      num_limbs: c::size_t);
-    fn LIMBS_sub_mod_ex(r: *mut limb::Limb, a: *const limb::Limb,
-                        m: *const limb::Limb, num_limbs: c::size_t,
-                        a_limbs: c::size_t);
+    fn LIMBS_sub_mod(r: *mut limb::Limb, a: *const limb::Limb,
+                     b: *const limb::Limb, m: *const limb::Limb,
+                     num_limbs: c::size_t);
 
     fn LIMBS_add_assign(r: *mut limb::Limb, a: *const limb::Limb,
                         num_limbs: c::size_t) -> limb::Limb;
@@ -1195,39 +1302,6 @@ mod tests {
     use super::*;
     use untrusted;
     use test;
-
-    #[test]
-    fn test_positive_integer_from_be_bytes_empty() {
-        // Empty values are rejected.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[])).is_err());
-    }
-
-    #[test]
-    fn test_positive_integer_from_be_bytes_zero() {
-        // The zero value is rejected.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[0])).is_err());
-        // A zero with a leading zero is rejected.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[0, 0])).is_err());
-        // A non-zero value with a leading zero is rejected.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[0, 1])).is_err());
-        // A non-zero value with no leading zeros is accepted.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[1])).is_ok());
-        // A non-zero value with that ends in a zero byte is accepted.
-        assert!(Positive::from_be_bytes(
-                    untrusted::Input::from(&[1, 0])).is_ok());
-    }
-
-    #[test]
-    fn test_odd_positive_from_even() {
-        let x = Positive::from_be_bytes(untrusted::Input::from(&[4])).unwrap();
-        assert!(x.into_odd_positive().is_err());
-    }
-
 
     // Type-level representation of an arbitrary modulus.
     struct M {}
@@ -1242,11 +1316,14 @@ mod tests {
             let m = consume_modulus::<M>(test_case, "M");
             let expected_result = consume_elem(test_case, "ModExp", &m);
             let base = consume_elem(test_case, "A", &m);
-            let e = consume_odd_positive(test_case, "E");
-
+            let e = {
+                let bytes = test_case.consume_bytes("E");
+                PrivateExponent::from_be_bytes_padded(
+                    untrusted::Input::from(&bytes), &m).expect("valid exponent")
+            };
             let base = into_encoded(base, &m);
-            let oneRR = One::newRR(&m).unwrap();
-            let one = One::newR(&oneRR, &m).unwrap();
+            let oneRR = One::newRR(&m);
+            let one = One::newR(&oneRR, &m);
             let actual_result = elem_exp_consttime(base, &e, &one, &m).unwrap();
             assert_elem_eq(&actual_result, &expected_result);
 
@@ -1266,8 +1343,8 @@ mod tests {
             let e = consume_public_exponent(test_case, "E");
 
             let base = into_encoded(base, &m);
-            let actual_result = elem_exp_vartime(base, e, &m).unwrap();
-            let actual_result = actual_result.into_unencoded(&m).unwrap();
+            let actual_result = elem_exp_vartime(base, e, &m);
+            let actual_result = actual_result.into_unencoded(&m);
             assert_elem_eq(&actual_result, &expected_result);
 
             Ok(())
@@ -1289,8 +1366,7 @@ mod tests {
                 Err(InversionError::Unspecified) => unreachable!("Unspecified"),
                 Err(InversionError::NoInverse) => unreachable!("No Inverse"),
             };
-            let one: Elem<M, Unencoded> = Elem::one()?;
-            let actual_result = elem_mul(&one, actual_result, &m)?;
+            let actual_result = elem_mul(&m.one(), actual_result, &m);
             assert_elem_eq(&actual_result, &expected_result);
             Ok(())
         })
@@ -1310,11 +1386,10 @@ mod tests {
             let n = consume_modulus::<N>(test_case, "M");
             let a = consume_elem(test_case, "A", &n);
             let expected_result = consume_elem(test_case, "R", &n);
-            let mut actual_result = Elem::<N, R>::zero()?;
+            let mut actual_result = n.zero();
             assert!(elem_set_to_inverse_blinded(&mut actual_result, &a, &n,
                                                 &rng).is_ok());
-            let one: Elem<N, Unencoded> = Elem::one()?;
-            let actual_result = elem_mul(&one, actual_result, &n)?;
+            let actual_result = elem_mul(&n.one(), actual_result, &n);
             assert_elem_eq(&actual_result, &expected_result);
             Ok(())
         })
@@ -1351,7 +1426,7 @@ mod tests {
 
             let n = consume_modulus::<N>(test_case, "M");
             let a = consume_elem(test_case, "A", &n);
-            let mut actual_result = Elem::<N, R>::zero()?;
+            let mut actual_result = n.zero();
             match elem_set_to_inverse_blinded(&mut actual_result, &a, &n, &rng) {
                 Err(InversionError::NoInverse) => (),
                 Err(InversionError::Unspecified) => unreachable!("Unspecified"),
@@ -1374,8 +1449,8 @@ mod tests {
 
             let b = into_encoded(b, &m);
             let a = into_encoded(a, &m);
-            let actual_result = elem_mul(&a, b, &m).unwrap();
-            let actual_result = actual_result.into_unencoded(&m).unwrap();
+            let actual_result = elem_mul(&a, b, &m);
+            let actual_result = actual_result.into_unencoded(&m);
             assert_elem_eq(&actual_result, &expected_result);
 
             Ok(())
@@ -1393,8 +1468,8 @@ mod tests {
             let a = consume_elem(test_case, "A", &m);
 
             let a = into_encoded(a, &m);
-            let actual_result = elem_squared(a, &m).unwrap();
-            let actual_result = actual_result.into_unencoded(&m).unwrap();
+            let actual_result = elem_squared(a, &m);
+            let actual_result = actual_result.into_unencoded(&m);
             assert_elem_eq(&actual_result, &expected_result);
 
             Ok(())
@@ -1414,12 +1489,12 @@ mod tests {
 
             let m = consume_modulus::<M>(test_case, "M");
             let expected_result = consume_elem(test_case, "R", &m);
-            let a = consume_elem_unchecked::<MM>(test_case, "A");
+            let a = consume_elem_unchecked::<MM>(
+                test_case, "A", expected_result.limbs.len() * 2);
 
             let actual_result = elem_reduced(&a, &m).unwrap();
-            let oneRR = One::newRR(&m).unwrap();
-            let actual_result =
-                elem_mul(oneRR.as_ref(), actual_result, &m).unwrap();
+            let oneRR = One::newRR(&m);
+            let actual_result = elem_mul(oneRR.as_ref(), actual_result, &m);
             assert_elem_eq(&actual_result, &expected_result);
 
             Ok(())
@@ -1443,7 +1518,7 @@ mod tests {
             let n = consume_modulus::<N>(test_case, "N");
             let a = consume_elem::<N>(test_case, "A", &n);
 
-            let actual_result = elem_reduced_once(&a, &qq).unwrap();
+            let actual_result = elem_reduced_once(&a, &qq);
             assert_elem_eq(&actual_result, &expected_result);
 
             Ok(())
@@ -1452,46 +1527,44 @@ mod tests {
 
     fn consume_elem<M>(test_case: &mut test::TestCase, name: &str, m: &Modulus<M>)
                        -> Elem<M, Unencoded> {
-        let value = consume_nonnegative(test_case, name);
-        value.into_elem::<M>(m).unwrap()
+        let value = test_case.consume_bytes(name);
+        Elem::from_be_bytes_padded(untrusted::Input::from(&value), m).unwrap()
     }
 
     #[cfg(feature = "rsa_signing")]
-    fn consume_elem_unchecked<M>(test_case: &mut test::TestCase, name: &str)
-            -> Elem<M, Unencoded> {
+    fn consume_elem_unchecked<M>(test_case: &mut test::TestCase, name: &str,
+                                 num_limbs: usize) -> Elem<M, Unencoded> {
         let value = consume_nonnegative(test_case, name);
+        let mut limbs = BoxedLimbs::zero(Width { num_limbs, m: PhantomData });
+        limbs[0..value.limbs().len()].copy_from_slice(value.limbs());
         Elem {
-            value: value,
-            m: PhantomData,
+            limbs,
             encoding: PhantomData,
         }
     }
 
     fn consume_modulus<M>(test_case: &mut test::TestCase, name: &str)
                           -> Modulus<M> {
-        let value = consume_odd_positive(test_case, name);
-        value.into_modulus().unwrap()
+        let value = test_case.consume_bytes(name);
+        let (value, _) = Modulus::from_be_bytes_with_bit_length(
+            untrusted::Input::from(&value)).unwrap();
+        value
     }
 
     fn consume_public_exponent(test_case: &mut test::TestCase, name: &str)
                                -> PublicExponent {
-        let value = consume_odd_positive(test_case, name);
-        value.into_public_exponent().unwrap()
-    }
-
-    fn consume_odd_positive(test_case: &mut test::TestCase, name: &str)
-                            -> OddPositive {
         let bytes = test_case.consume_bytes(name);
-        let value =
-            Positive::from_be_bytes(untrusted::Input::from(&bytes)).unwrap();
-        value.into_odd_positive().unwrap()
+        PublicExponent::from_be_bytes(
+            untrusted::Input::from(&bytes), 3).unwrap()
     }
 
+    #[cfg(feature = "rsa_signing")]
     fn consume_nonnegative(test_case: &mut test::TestCase, name: &str)
                            -> Nonnegative {
         let bytes = test_case.consume_bytes(name);
-        Nonnegative::from_be_bytes_padded(untrusted::Input::from(&bytes))
-            .unwrap()
+        let (r, _r_bits) = Nonnegative::from_be_bytes_with_bit_length(
+            untrusted::Input::from(&bytes)).unwrap();
+        r
     }
 
     fn assert_elem_eq<M, E>(a: &Elem<M, E>, b: &Elem<M, E>) {
@@ -1499,7 +1572,7 @@ mod tests {
     }
 
     fn into_encoded<M>(a: Elem<M, Unencoded>, m: &Modulus<M>) -> Elem<M, R> {
-        let oneRR = One::newRR(&m).unwrap();
-        elem_mul(&oneRR.as_ref(), a, m).unwrap()
+        let oneRR = One::newRR(&m);
+        elem_mul(&oneRR.as_ref(), a, m)
     }
 }
