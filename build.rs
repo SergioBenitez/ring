@@ -361,13 +361,14 @@ fn main() {
 fn ring_build_rs_main() {
     use std::env;
 
+    #[allow(deprecated)]
     let mut cfg = rayon::Configuration::new();
     if let Ok(amt) = std::env::var("NUM_JOBS") {
         if let Ok(amt) = amt.parse() {
             cfg = cfg.num_threads(amt);
         }
     }
-    #[allow(box_pointers)]
+    #[allow(box_pointers, deprecated)]
     rayon::initialize(cfg).unwrap();
 
     for (key, value) in env::vars() {
