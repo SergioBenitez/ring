@@ -224,7 +224,7 @@ impl PrivateKeyOps {
 
     #[inline(always)]
     pub fn point_mul(&self, p_scalar: &Scalar,
-                     &(ref p_x, ref p_y): &(Elem<R>, Elem<R>)) -> Point {
+                     (p_x, p_y): &(Elem<R>, Elem<R>)) -> Point {
         let mut r = Point::new_at_infinity();
         unsafe {
             (self.point_mul_impl)(r.xyz.as_mut_ptr(), p_scalar.limbs.as_ptr(),
@@ -651,31 +651,41 @@ mod tests {
             fn GFp_p256_scalar_sqr_rep_mont(r: *mut Limb, a: *const Limb,
                                             rep: c::int);
         }
-        scalar_square_test(&p256::COMMON_OPS, GFp_p256_scalar_sqr_rep_mont,
+        scalar_square_test(&p256::SCALAR_OPS, GFp_p256_scalar_sqr_rep_mont,
                            "src/ec/suite_b/ops/p256_scalar_square_tests.txt");
     }
 
     // XXX: There's no `p384_scalar_square_test()` because there's no dedicated
     // `GFp_p384_scalar_sqr_rep_mont()`.
 
-    fn scalar_square_test(ops: &CommonOps,
+    fn scalar_square_test(ops: &ScalarOps,
                           sqr_rep: unsafe extern fn(r: *mut Limb, a: *const Limb,
                                                     rep: c::int),
                           file_path: &str) {
         test::from_file(file_path, |section, test_case| {
             assert_eq!(section, "");
-            let a = consume_scalar(ops, test_case, "a");
-            let expected_result = consume_scalar(ops, test_case, "r");
-            let mut actual_result: Scalar<R> = Scalar {
-                limbs: [0; MAX_LIMBS],
-                m: PhantomData,
-                encoding: PhantomData,
-            };
-            unsafe {
-                sqr_rep(actual_result.limbs.as_mut_ptr(), a.limbs.as_ptr(), 1);
+            let cops = &ops.common;
+            let a = consume_scalar(cops, test_case, "a");
+            let expected_result = consume_scalar(cops, test_case, "r");
+
+            {
+                let mut actual_result: Scalar<R> = Scalar {
+                    limbs: [0; MAX_LIMBS],
+                    m: PhantomData,
+                    encoding: PhantomData,
+                };
+                unsafe {
+                    sqr_rep(actual_result.limbs.as_mut_ptr(), a.limbs.as_ptr(), 1);
+                }
+                assert_limbs_are_equal(cops, &actual_result.limbs,
+                                       &expected_result.limbs);
             }
-            assert_limbs_are_equal(ops, &actual_result.limbs,
-                                   &expected_result.limbs);
+
+            {
+                let actual_result = ops.scalar_product(&a, &a);
+                assert_limbs_are_equal(cops, &actual_result.limbs,
+                                       &expected_result.limbs);
+            }
 
             Ok(())
         })
@@ -908,11 +918,11 @@ mod tests {
         let actual_y = &cops.point_y(&actual_point);
         let actual_z = &cops.point_z(&actual_point);
         match expected_point {
-            &TestPoint::Infinity => {
+            TestPoint::Infinity => {
                 let zero = Elem::zero();
                 assert_elems_are_equal(cops, &actual_z, &zero);
             },
-            &TestPoint::Affine(ref expected_x, ref expected_y) => {
+            TestPoint::Affine(expected_x, expected_y) => {
                 let zz_inv = ops.elem_inverse_squared(&actual_z);
                 let x_aff = cops.elem_product(&actual_x, &zz_inv);
                 let y_aff = {

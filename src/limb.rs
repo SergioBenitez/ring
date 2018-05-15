@@ -84,8 +84,24 @@ pub fn limbs_less_than_limbs_vartime(a: &[Limb], b: &[Limb]) -> bool {
 }
 
 #[inline]
+pub fn limbs_less_than_limb_constant_time(a: &[Limb], b: Limb) -> LimbMask {
+    unsafe { LIMBS_less_than_limb(a.as_ptr(), b, a.len()) }
+}
+
+#[inline]
 pub fn limbs_are_zero_constant_time(limbs: &[Limb]) -> LimbMask {
     unsafe { LIMBS_are_zero(limbs.as_ptr(), limbs.len()) }
+}
+
+#[inline]
+pub fn limbs_are_even_constant_time(limbs: &[Limb]) -> LimbMask {
+    unsafe { LIMBS_are_even(limbs.as_ptr(), limbs.len()) }
+}
+
+#[cfg(any(test, feature = "rsa_signing"))]
+#[inline]
+pub fn limbs_equal_limb_constant_time(a: &[Limb], b: Limb) -> LimbMask {
+    unsafe { LIMBS_equal_limb(a.as_ptr(), b, a.len()) }
 }
 
 /// Equivalent to `if (r >= m) { r -= m; }`
@@ -210,9 +226,15 @@ pub fn big_endian_from_limbs_padded(limbs: &[Limb], out: &mut [u8]) {
 }
 
 versioned_extern! {
+    fn LIMBS_are_even(a: *const Limb, num_limbs: c::size_t) -> LimbMask;
     fn LIMBS_are_zero(a: *const Limb, num_limbs: c::size_t) -> LimbMask;
+    #[cfg(any(test, feature = "rsa_signing"))]
+    fn LIMBS_equal_limb(a: *const Limb, b: Limb, num_limbs: c::size_t)
+                        -> LimbMask;
     fn LIMBS_less_than(a: *const Limb, b: *const Limb, num_limbs: c::size_t)
                        -> LimbMask;
+    fn LIMBS_less_than_limb(a: *const Limb, b: Limb, num_limbs: c::size_t)
+                            -> LimbMask;
     fn LIMBS_reduce_once(r: *mut Limb, m: *const Limb, num_limbs: c::size_t);
 }
 
@@ -220,6 +242,143 @@ versioned_extern! {
 mod tests {
     use untrusted;
     use super::*;
+
+    const MAX: Limb = LimbMask::True as Limb;
+
+    #[test]
+    fn test_limbs_are_even() {
+        static EVENS: &[&[Limb]] = &[
+            &[],
+            &[0],
+            &[2],
+            &[0, 0],
+            &[2, 0],
+            &[0, 1],
+            &[0, 2],
+            &[0, 3],
+            &[0, 0, 0, 0, MAX],
+        ];
+        for even in EVENS {
+            assert_eq!(limbs_are_even_constant_time(even), LimbMask::True);
+        }
+        static ODDS: &[&[Limb]] = &[
+            &[1],
+            &[3],
+            &[1, 0],
+            &[3, 0],
+            &[1, 1],
+            &[1, 2],
+            &[1, 3],
+            &[1, 0, 0, 0, MAX],
+        ];
+        for odd in ODDS {
+           assert_eq!(limbs_are_even_constant_time(odd), LimbMask::False);
+        }
+    }
+
+    static ZEROES: &[&[Limb]] = &[
+        &[],
+        &[0],
+        &[0, 0],
+        &[0, 0, 0],
+        &[0, 0, 0, 0],
+        &[0, 0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ];
+
+    static NONZEROES: &[&[Limb]] = &[
+        &[1],
+        &[0, 1],
+        &[1, 1],
+        &[1, 0, 0, 0],
+        &[0, 1, 0, 0],
+        &[0, 0, 1, 0],
+        &[0, 0, 0, 1],
+    ];
+
+    #[test]
+    fn test_limbs_are_zero() {
+        for zero in ZEROES {
+            assert_eq!(limbs_are_zero_constant_time(zero), LimbMask::True);
+        }
+        for nonzero in NONZEROES {
+            assert_eq!(limbs_are_zero_constant_time(nonzero), LimbMask::False);
+        }
+    }
+
+    #[test]
+    fn test_limbs_equal_limb() {
+        for zero in ZEROES {
+            assert_eq!(limbs_equal_limb_constant_time(zero, 0), LimbMask::True);
+        }
+        for nonzero in NONZEROES {
+            assert_eq!(limbs_equal_limb_constant_time(nonzero, 0), LimbMask::False);
+        }
+        static EQUAL: &[(&[Limb], Limb)] = &[
+            (&[1], 1),
+            (&[MAX], MAX),
+            (&[1, 0], 1),
+            (&[MAX, 0, 0], MAX),
+            (&[0b100], 0b100),
+            (&[0b100, 0], 0b100),
+        ];
+        for &(a, b) in EQUAL {
+            assert_eq!(limbs_equal_limb_constant_time(a, b), LimbMask::True);
+        }
+        static UNEQUAL: &[(&[Limb], Limb)] = &[
+            (&[0], 1),
+            (&[2], 1),
+            (&[3], 1),
+            (&[1, 1], 1),
+            (&[0b100, 0b100], 0b100),
+            (&[1, 0, 0b100, 0, 0, 0, 0, 0], 1),
+            (&[1, 0, 0, 0, 0, 0, 0, 0b100], 1),
+            (&[MAX, MAX], MAX),
+            (&[MAX, 1], MAX),
+        ];
+        for &(a, b) in UNEQUAL {
+            assert_eq!(limbs_equal_limb_constant_time(a, b), LimbMask::False);
+        }
+    }
+
+    #[test]
+    fn test_limbs_less_than_limb_constant_time() {
+        static LESSER: &[(&[Limb], Limb)] = &[
+            (&[0], 1),
+            (&[0, 0], 1),
+            (&[1, 0], 2),
+            (&[2, 0], 3),
+            (&[2, 0], 3),
+            (&[MAX - 1], MAX),
+            (&[MAX - 1, 0], MAX),
+        ];
+        for &(a, b) in LESSER {
+            assert_eq!(limbs_less_than_limb_constant_time(a, b),
+                       LimbMask::True);
+        }
+        static EQUAL: &[(&[Limb], Limb)] = &[
+            (&[0], 0),
+            (&[0, 0, 0, 0], 0),
+            (&[1], 1),
+            (&[1, 0, 0, 0, 0, 0, 0], 1),
+            (&[MAX], MAX),
+        ];
+        static GREATER: &[(&[Limb], Limb)] = &[
+            (&[1], 0),
+            (&[2, 0], 1),
+            (&[3, 0, 0, 0], 1),
+            (&[0, 1, 0, 0], 1),
+            (&[0, 0, 1, 0], 1),
+            (&[0, 0, 1, 1], 1),
+            (&[MAX], MAX - 1),
+        ];
+        for &(a, b) in EQUAL.iter().chain(GREATER.iter()) {
+            assert_eq!(limbs_less_than_limb_constant_time(a, b),
+                       LimbMask::False);
+        }
+    }
 
     #[test]
     fn test_parse_big_endian_and_pad_consttime() {

@@ -66,7 +66,7 @@
 #![cfg_attr(feature = "internal_benches", allow(unstable_features))]
 #![cfg_attr(feature = "internal_benches", feature(test))]
 
-#[cfg(any(feature = "use_heap", target_os = "linux"))]
+#[cfg(any(feature = "rsa_signing", target_os = "linux"))]
 extern crate libc;
 
 #[cfg(feature = "internal_benches")]
@@ -79,6 +79,9 @@ extern crate test as bench;
                   feature = "dev_urandom_fallback"))))]
 #[macro_use]
 extern crate lazy_static;
+
+#[macro_use]
+mod debug;
 
 // `ring::test` uses the formatting & printing stuff in non-test mode.
 #[macro_use]
