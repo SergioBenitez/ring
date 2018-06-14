@@ -207,6 +207,11 @@
 #define bssl_constant_time_test_main GFp_VERSIONED(bssl_constant_time_test_main)
 #define gfp_little_endian_bytes_from_scalar GFp_VERSIONED(gfp_little_endian_bytes_from_scalar)
 
+// ARM/AArch64 specific
+#define GFp_aes_c_encrypt GFp_VERSIONED(GFp_aes_c_encrypt)
+#define GFp_aes_hw_decrypt GFp_VERSIONED(GFp_aes_hw_decrypt)
+#define GFp_aes_c_set_encrypt_key GFp_VERSIONED(GFp_aes_c_set_encrypt_key)
+
 // For MacOS symbols generated from perl scripts.
 #define _GFp_AES_encrypt GFp_VERSIONED(_GFp_AES_encrypt)
 #define _GFp_AES_set_encrypt_key GFp_VERSIONED(_GFp_AES_set_encrypt_key)
@@ -412,3 +417,7 @@
 
 #define _bssl_constant_time_test_main GFp_VERSIONED(_bssl_constant_time_test_main)
 #define _gfp_little_endian_bytes_from_scalar GFp_VERSIONED(_gfp_little_endian_bytes_from_scalar)
+
+#define _GFp_aes_c_encrypt GFp_VERSIONED(_GFp_aes_c_encrypt)
+#define _GFp_aes_hw_decrypt GFp_VERSIONED(_GFp_aes_hw_decrypt)
+#define _GFp_aes_c_set_encrypt_key GFp_VERSIONED(_GFp_aes_c_set_encrypt_key)
